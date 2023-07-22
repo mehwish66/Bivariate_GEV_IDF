@@ -1,0 +1,795 @@
+---
+title: "Berlin-Tegel.GERMANY"
+author: "Mehwish Zaman"
+date: "`r Sys.Date()`"
+output: html_document
+editor_options: 
+  chunk_output_type: inline
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+00427 19950901 20230606             46     52.3807   13.5306 Berlin Brandenburg                       Brandenburg          
+
+```{r }
+rm(list = ls())
+library(tidydr)
+library(dplyr)
+library(lubridate,warn.conflicts = FALSE)
+library(zoo)
+library(ggplot2)
+library(extRemes)
+library(evd)
+library(ismev)
+library(SpatialExtremes) ## gevtofre
+```
+
+## Including Plots
+
+You can also embed plots, for example:
+
+```{r  Data}
+
+produkt_rr_stunde_00430 <- read.csv("D:/Research-2023/PhDUnipd/Data folder/datafiles-20230222T055301Z-001/datafiles/produkt_rr_stunde_00430.txt", header=TRUE, sep=";")
+
+Berlin_430<- produkt_rr_stunde_00430
+
+Berlin_430$MESS_DATUM <- ymd_h(Berlin_430$MESS_DATUM)
+Berlin_430$R1[Berlin_430$R1 == -999] <- NA
+sum(is.na(Berlin_430))
+Berlin_dt <- Berlin_430[,c("MESS_DATUM", "R1")] ## only take the col containing dates and precipitations 
+min(Berlin_dt$MESS_DATUM)
+max(Berlin_dt$MESS_DATUM)
+Berlin_dt<-Berlin_dt %>% filter(MESS_DATUM >'1995-12-31 24:00:00' &  MESS_DATUM < '2021-01-01 00:00:00')
+
+```
+
+Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
+```{r counts}
+Berlin_dt %>% group_by(year=year(MESS_DATUM)) %>% count()
+Berlin_dt %>% group_by(year=year(MESS_DATUM), month=month(MESS_DATUM)) %>% count()
+Berlin_dt %>% group_by(year=year(MESS_DATUM), month=month(MESS_DATUM), day=day(MESS_DATUM)) %>% count()
+
+```
+
+
+```{r}
+Berlin_dt<-Berlin_dt %>% filter(MESS_DATUM >'1995-12-31 24:00:00' &  MESS_DATUM < '2021-01-01 00:00:00')## there are some month missing in 1995 and 
+
+runmean.1h = rollapplyr(as.zoo(Berlin_dt$R1),1,FUN=sum,fill =NA,align='right')
+runmean.2h = rollapplyr(as.zoo(Berlin_dt$R1),2,FUN=sum,fill =NA,align='right')/2
+runmean.3h = rollapplyr(as.zoo(Berlin_dt$R1),3,FUN=sum,fill =NA,align='right')/3
+runmean.4h = rollapplyr(as.zoo(Berlin_dt$R1),4,FUN=sum,fill =NA,align='right')/4
+runmean.5h = rollapplyr(as.zoo(Berlin_dt$R1),6,FUN=sum,fill =NA,align='right')/5
+runmean.6h = rollapplyr(as.zoo(Berlin_dt$R1),12,FUN=sum,fill =NA,align='right')/6
+runmean.7h = rollapplyr(as.zoo(Berlin_dt$R1),24,FUN=sum,fill =NA,align='right')/7
+runmean.8h = rollapplyr(as.zoo(Berlin_dt$R1),48,FUN=sum,fill =NA,align='right')/8
+runmean.9h = rollapplyr(as.zoo(Berlin_dt$R1),72,FUN=sum,fill =NA,align='right')/9
+MESS_DATUM<-Berlin_dt$MESS_DATUM
+Berlin_dt.h<-data.frame(MESS_DATUM, runmean.1h, runmean.2h, runmean.3h,runmean.4h,runmean.6h,runmean.12h, runmean.24h, runmean.48h, runmean.72h)
+```
+
+# Generate series of annual maxima
+To perfom a frequency analysis, we need a series with the maximum rainfall intensity in each of the years of the original data. Since our final goal is to derive an intensity-duration-frequency curve, we must repeat this process for several durations.
+
+
+```{r}
+Berlin_dt.h_maxh<- Berlin_dt.h %>% 
+  dplyr::mutate(year = format(MESS_DATUM, "%Y")) %>%
+  group_by(year) %>%
+  dplyr::summarize(m.1h = max(runmean.1h,na.rm=TRUE),m.2h = max(runmean.2h, na.rm=TRUE), m.3h = max(runmean.3h, na.rm=TRUE),m.h6 = max(runmean.6h, na.rm=TRUE), m.h12 = max(runmean.12h, na.rm=TRUE), m.h24 = max(runmean.24h, na.rm=TRUE), m.h48 = max(runmean.48h, na.rm=TRUE), m.h72= max(runmean.72h, na.rm=TRUE)) %>% 
+  as.data.frame()
+
+```
+
+
+```{r duration dependent gev}
+w1<- Berlin_dt.h_maxh$m.1h
+w2<- Berlin_dt.h_maxh$m.2h
+annualmax <- data.frame(w1,w2)
+likehood<-function(par,d,annualmax) {
+  ### IDF-parameters :IDF model for d[1,72]:
+  mu<-par[1]
+  sigma<-par[2]
+  gamma<-par[3]
+  eta<-par[4]
+  d<-c(1,2)
+  lh.mat<-array(0,dim=dim(annualmax))
+  Y<-array(0,dim=dim(annualmax))
+  ### Loop over rainfall durations #####
+  for (i in 1:length(d)) {
+    sigma_d<-sigma*(d[i])^(-eta) 
+    mu_d<- mu*sigma_d
+    Y[,i]<-1+gamma*(annualmax[,i]-mu_d)/sigma_d
+    if (min(Y[,i],na.rm=TRUE)>0) {
+      lh.mat[,i]<- -log(sigma_d)-Y[,i]^(-1/gamma)-(1+1/gamma)*log(Y[,i])   ### GEV-loglikelihood for duration d[i]
+    } 
+    else {
+      lh.mat[,i]<--10^10
+    }
+  }
+  ##################################
+  ### Make sum of the log-likelihoods over the years and rainfall durations d, and return
+  
+  return(-sum(lh.mat,na.rm=TRUE))
+}
+par0<-c(2.15, 1.2 ,0.46 , 0.57) ## Inital Value for Optimisation 
+likehood(par = par0, d=d, annualmax=annualmax)
+result_r<-optim(par0,likehood,annualmax=annualmax, method = "L-BFGS-B",lower = c(-Inf, 0.1,-Inf, 0.01),
+    upper = c(Inf, Inf,Inf, 0.999), hessian = TRUE) 
+result_r
+
+
+
+```
+
+
+```{r}
+partrue<- c(3.2, 3.5,0.47,0.55, 0.45)
+d<- c(1,2)
+s1<- partrue[2]/(d[1]^(partrue[4])) ### s(d)= s_o * d^(-eta)
+s2<- partrue[2]/(d[2]^(partrue[4]))
+u1 <- partrue[1]*s1                    ### u(d)= tilda(u)*s(d)
+u2 <- partrue[1]*s2
+k1 <- partrue[3]
+k2<- partrue[3]
+mr1 <- c(u1,s1,k1)
+mr2<- c(u2,s2,k2)
+#margins <- matrix(parmeter, nrow = 2, byrow = TRUE)
+data_new<-rbvevd(500, dep = partrue[5], model = "log", mar1 = mr1, mar2 = mr2)
+colnames(data_new)<- c("d1","d2")
+data_new
+fbvevd(data_new, model="log")
+sum(dbvevd(data_new, dep=partrue[5], model="log",mar1 = mr1, mar2 = mr2, log = TRUE))
+plot(data_new)
+```
+
+```{r}
+z11<-data_new[,1]
+z21<-data_new[,2]
+dt <- data.frame(z11,z21)
+n1<-n2<-length(z11)
+like <- function(par2, dt, debug=FALSE ) { #debug=FALSE
+  dt<- dt
+  epsi<- 10^(-16)
+  m1<- par2[1]
+  s1<- par2[2]
+  k1<- par2[3]
+  m2<- par2[4]
+  s2 <-par2[5]
+  k2<-par2[6]
+  a<- par2[7]
+  if (debug) cat(m1,s1,k1,m2,s2,k2,a," ")
+  mod1<- pmax(0, (1 + ((k1) * (dt$z11 - m1)/s1)))
+  mod2<- pmax(0, (1 + ((k2) * (dt$z21 - m2)/s2)))
+  y1<- (mod1)^1/k1
+  y2<- (mod2)^1/k2
+   y <- (1/(y1^(1/a))+1/(y2^(1/a)))
+  if(any(y1<= 0)||any(y2 <= 0 ) || any(s1 <= 0) || any(s2 <= 0)|| any(y <= 0)) return(10^6)
+  #if(length(a) != 1 || mode(a) != "numeric" || a <= 0 || a > 1) return(10^6)
+   if(any(a <= epsi ) || any(a >= 1-epsi)) return(10^6)
+  g<- -log(s1)-log(s2)-(y)^a +(a - 2)*y + log(y^a -1+ 1/a) -(1/a)*log(y1) -(1/a)*log(y2) -k1*log(y1)-k2*log(y2) 
+  if (debug) cat(g,"\n")
+  sum(-g)
+}
+start <- c( 11.20,  3.50,  0.47 ,7.65, 2.40, 0.47 ,0.45)
+like(par2=start, dt=dt)
+result <- optim(start,like, dt=dt, debug=FALSE,  method = "Nelder-Mead", hessian = T,
+               control=list(maxit=5000))
+result
+```
+
+
+
+
+
+```{r}
+x1<-data_new[,1]
+x2<-data_new[,2]
+annualmax <- data.frame(x1,x2)
+likehood<-function(par,d,annualmax) {
+  ### IDF-parameters :IDF model for d[1,72]:
+  mu<-par[1]
+  sigma<-par[2]
+  gamma<-par[3]
+  eta<-par[4]
+  d<-c(1,2)
+  epsi<-10^(-16)
+  lh.mat<-array(0,dim=dim(annualmax))
+  Y<-array(0,dim=dim(annualmax))
+  ### Loop over rainfall durations #####
+  for (i in 1:length(d)) {
+    sigma_d<-sigma*(d[i])^(-eta) 
+    mu_d<- mu*sigma_d
+    Y[,i]<-1+gamma*(annualmax[,i]-mu_d)/sigma_d
+    if(any(eta <= epsi || eta > 1-epsi)) return(10^6)
+    if (min(Y[,i],na.rm=TRUE)>0) {
+      lh.mat[,i]<- -log(sigma_d)-Y[,i]^(-1/gamma)-(1+1/gamma)*log(Y[,i])   ### GEV-loglikelihood for duration d[i]
+    } 
+    else {
+      lh.mat[,i]<--10^10
+    }
+  }
+  ##################################
+  ### Make sum of the log-likelihoods over the years and rainfall durations d, and return
+  
+  return(-sum(lh.mat,na.rm=TRUE))
+}
+likehood(par = par0, d=d, annualmax=annualmax)
+par0<-c(3.20, 3.50 , 0.47 , 0.55 ) ## Inital Value for Optimisation 
+result_r<-optim(par0,likehood,annualmax=annualmax, method = "Nelder-Mead", hessian = T, control=list(maxit=5000)) 
+result_r
+```
+
+```{r initial values}
+x1<-data_new[,1]
+x2<-data_new[,2]
+dt<- c(x1,x2)
+d<- c(rep(1, length(x1)),rep(2, length(x2)) )
+data.int <- data.frame(dt,d)
+gev.d.init <- function(data.int,d){
+  durs <- unique(d)
+  mles <- matrix(NA, nrow=length(durs), ncol= 3)
+  for(i in 1:length(durs)){
+    fit <- ismev::gev.fit(data.int$dt[d==durs[i]])
+    mles[i,] <- fit$mle
+  }
+  return(mles)
+}
+mles<- gev.d.init(data.int = data.int, d=d)
+durs <- unique(d)
+lmsig <- lm(log(mles[,2])~log(durs))
+summary(lmsig)
+lmmu <- lm(log(mles[,1])~log(durs))
+siginit <- exp(lmsig$coefficients[[1]])
+etainit <- -median(c(-lmsig$coefficients[[2]],-lmmu$coefficients[[2]]))
+muinit <- median(c(mles[,1]/mles[,2]),na.rm = TRUE)
+shinit <- median(mles[,3],na.rm = TRUE)
+alphainit <- cor(x1,x2)
+init.par<- list(mu=muinit,sigma=siginit,xi=shinit,eta=etainit, alpha=alphainit)
+
+```
+
+
+
+
+
+
+```{r  dependent d-GEV model bivariate case}
+x1<- Berlin_dt.h_maxh$m.1h
+x2<- Berlin_dt.h_maxh$m.2h
+data1 <- data.frame(x1,x2)
+
+dep.gev.fit <- function(par, data1, debug=FALSE)
+{
+  epsi<- 10^(-6)
+  mu<-par[1]
+  sigma_o<- par[2]
+  k<- par[3]
+  eta<- par[4]
+  a <- par[5]
+  if (debug) cat(mu,sigma_o,k,eta,a," ")
+  d <- c(1,2)
+  s1 <- (sigma_o)/(d[1])^eta
+  s2 <- (sigma_o)/(d[2])^eta
+  m1 <- mu * s1
+  m2 <- mu * s2
+  y1<- (pmax(0, (1 + (k * (data1$x1 - m1)/s1))))^(1/k)
+  y2<- ( pmax(0, (1 + (k * (data1$x2 - m2)/s2))))^(1/k)
+  y <- (1/(y1^(1/a))+1/(y2^(1/a)))
+  if(any(y1<= 0)||any(y2 <= 0 ) || any(s1 <= 0) || any(s2 <= 0)|| any(y <= 0)) return(10^6)
+  if(eta <= epsi || eta >= 1-epsi)return(10^6)
+   if(any(a <= epsi ) || any(a > 1-epsi)) return(10^6)
+  g<- -sum(-log(s1)-log(s2)-(y)^a + (a - 2)*log(y) + log(y^a - 1+ 1/a)- (1/a)*log(y1)-k*log(y1)- (1/a)*log(y2)-k*log(y2), na.rm = TRUE)
+  if (debug) cat(g,"\n")
+  return(g)
+}
+dep.gev.fit(par=partrue, data1=data1, debug=TRUE)
+#optim2 <- nlminb(start = par_1, objective =dep.gev.fit,data=data, lower = c(0, 0,-0.5, 0.01, 0.01), upper = c(Inf, Inf,0.80, 0.99,  0.99), hessian = TRUE)
+optim2 <- optim(par=partrue, dep.gev.fit, data1=data1, debug=TRUE, method = "Nelder-Mead", hessian = T, control=list(maxit=5000))
+optim2
+
+
+```
+```{r}
+mu<- optim2$par[1]
+sigma<- optim2$par[2]
+xi<- optim2$par[1]
+T <- c(2, 5, 10, 20,30, 50, 100)
+p<- 1-1/T
+Z <- function(T) {
+  mu + sigma/xi * ((-log(p))^xi - 1)
+}
+Z_values <- sapply(p, Z)
+plot(T, Z_values, type = "b", xlab = "Return period (years)", ylab = "Z")
+```
+
+
+
+
+```{r MC-d-GEV}
+t1<- Berlin_dt.h_maxh$m.1h
+t2<- Berlin_dt.h_maxh$m.2h
+mc_data <- data.frame(t1,t2)
+
+mc_dep.gev.fit <- function(mc_par, mc_data, debug=FALSE)
+{
+  epsi<- 10^(-6)
+  mu<-mc_par[1]
+  sigma_o<- mc_par[2]
+  k<- mc_par[3]
+  eta<- mc_par[4]
+  a <- mc_par[5]
+  if (debug) cat(mu,sigma_o,k,eta,a," ")
+  d <- c(1,2)
+  s1 <- (sigma_o)/(d[1])^eta
+  s2 <- (sigma_o)/(d[2])^eta
+  m1 <- mu * s1
+  m2 <- mu * s2
+  y1<- (pmax(0, (1 + (k * (mc_data$t1 - m1)/s1))))^(1/k)
+  y2<- ( pmax(0, (1 + (k * (mc_data$t2 - m2)/s2))))^(1/k)
+  y <- (1/(y1^(1/a))+1/(y2^(1/a)))
+  if(any(y1<= 0)||any(y2 <= 0 ) || any(s1 <= 0) || any(s2 <= 0)|| any(y <= 0)) return(10^6)
+  if(eta <= epsi || eta >= 1-epsi)return(10^6)
+   if(any(a <= epsi ) || any(a > 1-epsi)) return(10^6)
+  g<- -sum(-log(s1)-log(s2)-(y)^a + (a - 2)*log(y) + log(y^a - 1+ 1/a)- (1/a)*log(y1)-k*log(y1)- (1/a)*log(y2)-k*log(y2)-log(s1)- 1/y1- (1+k)*log(y1), na.rm = TRUE)
+  if (debug) cat(g,"\n")
+  return(g)
+} 
+mc_dep.gev.fit(mc_par=partrue, mc_data=mc_data, debug=TRUE)
+optim2 <- optim(partrue, mc_dep.gev.fit, mc_data=mc_data, debug=TRUE, method = "Nelder-Mead", hessian = T, control=list(maxit=5000))
+optim2
+
+```
+```{r}
+#sum(evmc(500,dep = 0.45, model = "log", margins = c("frechet")))
+
+```
+```{r}
+x1<-data_new[,1]
+x2<-data_new[,2]
+annualmax <- data.frame(x1,x2)
+likehood<-function(par,d,annualmax) {
+  mu<-par[1]
+  sigma<-par[2]
+  k<-par[3]
+  eta<-par[4]
+  a<- par[5]
+  d<-c(1,2)
+  epsi<-10^(-16)
+  ll<-array(0,dim=dim(annualmax))
+  mod<-array(0,dim=dim(annualmax))
+  Y<- array(0,dim=dim(annualmax))
+  S<- array(0,dim=dim(annualmax))
+  ### Loop over rainfall durations #####
+  for (i in 2:length(d)) {
+    sigma_d<-sigma*(d[i])^(-eta) 
+    mu_d<- mu*sigma_d
+    mod[,i]<-(1+k*(annualmax[,i]-mu_d)/sigma_d)^(1/k)
+    mod[,i-1]<-(1+k*(annualmax[,i-1]-mu_d)/sigma_d)^(1/k)
+    Y[,i]<- (1/(mod[,i])^(1/a))
+    Y[,i-1]<- (1/(mod[,i-1])^(1/a))
+    S[,i]<-  Y[,i]+ Y[,i-1]
+    if(any(eta <= epsi || eta > 1-epsi)) return(10^6)
+    if(any(a <= epsi || a > 1-epsi)) return(10^6)
+    if (min(Y[,i], Y[,i-1],mod[,i], mod[,i-1], S[,i] , na.rm=TRUE)>0) {
+      ll[,i]<- -log(sigma_d)- (S[,i])^a +(a-2)*log(S[,i])+log((S[,i])^a -1+1/a)- (1/a)*log(Y[,i])-k*log(Y[,i])-(1/a)*log( Y[,i-1]) - k*log( Y[,i-1])-1/mod[,i-1]-(1+k)*log(mod[,i-1])
+    } 
+    else {
+      ll[,i]<--10^10
+    }
+  }
+  return(-sum(ll,na.rm=TRUE))
+} #-log(s1)-log(s2)-(y)^a + (a - 2)*log(y) + log(y^a - 1+ 1/a)- (1/a)*log(y1)-k*log(y1)- (1/a)*log(y2)-k*log(y2)-log(s1)- 1/y1- (1+k)*log(y1)
+likehood(par = par0, d=d, annualmax=annualmax)
+par0<-c(3.20, 3.50 , 0.47 , 0.55 , 0.45) ## Inital Value for Optimisation 
+result_r<-optim(par0,likehood,annualmax=annualmax, method = "Nelder-Mead", hessian = T, control=list(maxit=5000)) 
+result_r
+
+```
+
+
+```{r likelihood for Bivariate case}
+
+### the block maxima data
+z11 <- Berlin_dt.h_maxh$m.1h
+z21 <- Berlin_dt.h_maxh$m.2h
+
+##Fit the GEV distribution to each block maxima series separately (ismev)
+
+fit_z11 <- gev.fit(z11)
+fit_z21 <- gev.fit(z21)
+
+#Extract the estimated parameters
+mu_1 <-fit_z11$mle[1]
+sigma_1 <- fit_z11$mle[2]
+gamma_1 <- fit_z11$mle[3]
+mu_2 <-fit_z21$mle[1]
+sigma_2 <- fit_z21$mle[2]
+gamma_2 <- fit_z21$mle[3]
+
+###Transform the  block maxima series (z11, z21) to unit Frechet distribution, p(x<z11)= exp(-1/z11)
+
+t1<- gev2frech(z11, mu_1,sigma_1, gamma_1, emp = FALSE)
+t2<- gev2frech(z21, mu_2,sigma_2, gamma_2, emp = FALSE)
+
+trans_Z1<- 1/((1 + gamma_1 * ((z11 - mu_1) / sigma_1))^(-1 / gamma_1))
+
+trans_Z2<-  1/((1 + gamma_2 * ((z21 - mu_2) / sigma_2))^(-1 / gamma_2))
+
+Z1 <- trans_Z1
+Z2 <- trans_Z2
+t11<- Berlin_dt.h_maxh$m.1h
+t12 <- Berlin_dt.h_maxh$m.2h
+dt <- data.frame(t11, t12)
+like <- function(par2, dt) {
+  dt<- dt
+  m1<- par2[1]
+  m2<- par2[2]
+  s1<- par2[3]
+  s2 <- par2[4]
+  k1<- par2[5]
+  k2<-par2[6]
+  a<- par2[7]
+  mod1<- pmax(0, (1 + ((k1) * (dt$t11 - m1)/s1)))
+  mod2<- pmax(0, (1 + ((k2) * (dt$t12 - m2)/s2)))
+  y1<- (mod1)^1/k1
+  y2<- (mod2)^1/k2
+  y <- ((y1)^(-1/a)+(y2)^(-1/a))
+   if(min(mod1,mod2, y, na.rm = TRUE ) > 0){
+    f <-  -2*log(s1)-2*log(s2)-(y)^a +  (a - 2)*log(y) + log(y^a - (a - 1)/a) -
+      (1 + 1/(k1*a))*log(mod1)  - (1 + 1/(k2*a))*log(mod2)- (1+1/k1)*log(mod1) -(1+1/k2)*log(mod2)- (mod1)^(-1/k1)-(mod2)^(-1/k2)
+  }
+  else{
+    f <- -10^10
+  }
+  
+   return((-sum(f)))
+}
+
+like(start, dt)
+start <- c('m1'= 5.0,'m2'= 6.09, 's1'= 3.6, 's2'= 4.3, 'k1'=0.67, 'k2' = 0.90, 'a'= 0.75)
+result <- optim(start,like, dt=dt,  method = "L-BFGS-B",lower = c(-Inf,-Inf,0, 0,-Inf,-Inf, 0.01), upper = c(Inf, Inf,Inf,Inf, Inf,Inf, 0.99), hessian = TRUE)
+result
+
+
+
+
+```
+
+
+
+```{r Bivariate case}
+
+dep_1_2h<-data.frame(Berlin_dt.h_maxh$m.1h,Berlin_dt.h_maxh$m.2h)
+M1<-fbvevd(dep_1_2h , model = "log", std.err = TRUE)
+M1$call
+#dif1 <-  (Berlin_dt.h_maxh$m.1h - Berlin_dt.h_maxh$m.2h)
+
+####1h and 3h
+dep_1_3h<-data.frame(Berlin_dt.h_maxh$m.1h ,Berlin_dt.h_maxh$m.3h)
+M13<-fbvevd(dep_1_3h , model = "log", std.err = TRUE)
+#dif2 <- (Berlin_dt.h_maxh$m.1h - Berlin_dt.h_maxh$m.3h)
+
+####1h and 6h
+dep_1_6h<-data.frame(Berlin_dt.h_maxh$m.1h ,Berlin_dt.h_maxh$m.h6)
+M16<-fbvevd(dep_1_6h , model = "log", std.err = TRUE)
+#dif6 <- (Berlin_dt.h_maxh$m.1h - Berlin_dt.h_maxh$m.h6)
+
+#####1h and 12h
+
+dep_1_12h<-data.frame(Berlin_dt.h_maxh$m.1h ,Berlin_dt.h_maxh$m.h12)
+M12<-fbvevd(dep_1_12h , model = "log", std.err = TRUE)
+#dif112 <- (Berlin_dt.h_maxh$m.1h - Berlin_dt.h_maxh$m.h12)
+#####1h and 24h
+dep_1_24h<-data.frame(Berlin_dt.h_maxh$m.1h ,Berlin_dt.h_maxh$m.h24)
+M24<-fbvevd(dep_1_24h , model = "log", std.err = TRUE)
+#dif124 <- (Berlin_dt.h_maxh$m.1h - Berlin_dt.h_maxh$m.h24)
+#####1h and 48h
+dep_1_48h<-data.frame(Berlin_dt.h_maxh$m.1h ,Berlin_dt.h_maxh$m.h48)
+M48 <-fbvevd(dep_1_48h , model = "log", std.err = TRUE)
+#dif148 <- (Berlin_dt.h_maxh$m.1h - Berlin_dt.h_maxh$m.h48)
+#####1h and 72h
+dep_1_72h<-data.frame(Berlin_dt.h_maxh$m.1h ,Berlin_dt.h_maxh$m.h72)
+M72<-fbvevd(dep_1_72h , model = "log", std.err = TRUE)
+#dif172 <- (Berlin_dt.h_maxh$m.1h - Berlin_dt.h_maxh$m.h72)
+
+
+
+#####2h and 3h
+dep_2_3h<-data.frame(Berlin_dt.h_maxh$m.2h,Berlin_dt.h_maxh$m.3h)
+M23<-fbvevd(dep_2_3h , model = "log", std.err = TRUE)
+#####2h and 6h
+dep_2_6h<-data.frame(Berlin_dt.h_maxh$m.2h,Berlin_dt.h_maxh$m.h6)
+M26<-fbvevd(dep_2_6h , model = "log", std.err = TRUE)
+#####2h and 12h
+dep_2_12h<-data.frame(Berlin_dt.h_maxh$m.2h,Berlin_dt.h_maxh$m.h12)
+M2_12<-fbvevd(dep_2_12h , model = "log", std.err = TRUE)
+#####2h and 24h
+dep_2_24h<-data.frame(Berlin_dt.h_maxh$m.2h,Berlin_dt.h_maxh$m.h24)
+M2_24<-fbvevd(dep_2_24h , model = "log", std.err = TRUE)
+#####2h and 48h
+dep_2_48h<-data.frame(Berlin_dt.h_maxh$m.2h,Berlin_dt.h_maxh$m.h48)
+M2_48<-fbvevd(dep_2_48h , model = "log", std.err = TRUE)
+#####2h and 72h
+dep_2_72h<-data.frame(Berlin_dt.h_maxh$m.2h,Berlin_dt.h_maxh$m.h72)
+M2_72<-fbvevd(dep_2_72h , model = "log", std.err = TRUE)
+
+#####3h and 6h
+dep36<- data.frame(Berlin_dt.h_maxh$m.3h,Berlin_dt.h_maxh$m.h6)
+M36 <- fbvevd(dep36 , model = "log", std.err = TRUE)
+#####3h and 12h
+dep312<- data.frame(Berlin_dt.h_maxh$m.3h,Berlin_dt.h_maxh$m.h12)
+M312 <- fbvevd(dep312 , model = "log", std.err = TRUE)
+#####3h and 24h
+dep324<- data.frame(Berlin_dt.h_maxh$m.3h,Berlin_dt.h_maxh$m.h24)
+M324 <- fbvevd(dep324 , model = "log", std.err = TRUE)
+#####3h and 48h
+dep348<- data.frame(Berlin_dt.h_maxh$m.3h,Berlin_dt.h_maxh$m.h48)
+M348 <- fbvevd(dep348 , model = "log", std.err = TRUE)
+#####3h and 72h
+dep372<- data.frame(Berlin_dt.h_maxh$m.3h,Berlin_dt.h_maxh$m.h72)
+M372 <- fbvevd(dep372 , model = "log", std.err = TRUE)
+
+dep1.all <- c(M1$estimate[7],M13$estimate[7], M16$estimate[7] , M12$estimate[7], M24$estimate[7], M48$estimate[7], M72$estimate[7])
+#alldiff <- data.frame(dif1, dif2, dif6, dif112, dif124, dif148, dif172)
+
+dep2.all <- data.frame(M23$estimate[7],M26$estimate[7], M2_12$estimate[7] , M2_24$estimate[7], M2_48$estimate[7], M2_72$estimate[7])
+
+dep3.all <-  data.frame(M36$estimate[7],M312$estimate[7], M324$estimate[7] , M348$estimate[7], M372$estimate[7])
+
+```
+
+
+
+
+
+
+
+```{r plot of logistic parameter (alpha) and difference in distance}
+# Define the durations
+durations <- c(1, 2, 3, 6, 12, 24, 48, 72)
+
+# Generate all unique combinations of durations without replacement for d1, d2, and d3
+# Define the durations
+
+# Generate all order pairs with 1, 2 3, 6, 12
+order_pairs_1 <- paste0("1,", durations[2:8])
+order_pairs_2 <- paste0("2,", durations[3:8])
+order_pairs_3 <- paste0("3,", durations[4:8])
+order_pairs_6 <- paste0("6,", durations[5:8])
+
+# Calculate the absolute difference in durations for each set of duration pairs
+diff_d1 <- sapply(strsplit(order_pairs_1, ","), function(x) abs(diff(as.numeric(x))))
+diff_d2 <- sapply(strsplit(order_pairs_2, ","), function(x) abs(diff(as.numeric(x))))
+diff_d3 <- sapply(strsplit(order_pairs_3, ","), function(x) abs(diff(as.numeric(x))))
+diff_d6 <- sapply(strsplit(order_pairs_6, ","), function(x) abs(diff(as.numeric(x))))
+
+# Define the alpha values for d1, d2, and d3
+alpha1 <- c(1-M1$estimate[7],1-M13$estimate[7], 1-M16$estimate[7] , 1-M12$estimate[7], 1-M24$estimate[7], 1-M48$estimate[7], 1-M72$estimate[7])
+alpha2 <- c(1-M23$estimate[7],1-M26$estimate[7], 1-M2_12$estimate[7] , 1-M2_24$estimate[7], 1-M2_48$estimate[7], 1-M2_72$estimate[7])
+alpha3 <- c(1-M36$estimate[7],1-M312$estimate[7], 1-M324$estimate[7] ,1- M348$estimate[7], 1-M372$estimate[7])
+# Plot the absolute differences for all duration groups
+plot( diff_d1, alpha1,  xlab = "Durations[h]", ylab = "Beta" , main = "Berlin-Tegel Germany ", type = "b", col = "blue", xlim = c(1, 71), ylim = c(0.01, 1))
+
+# Add lines for the other two duration groups
+lines( diff_d2,alpha2, type = "b", col = "red")
+lines( diff_d3, alpha3,type = "b", col = "green")
+
+# Add a legend
+legend("topright", legend = c("1h", "2h", "3h"), col = c("blue", "red", "green"), lty = 1)
+
+# Add gridlines
+grid()
+dev.copy(jpeg,filename="plot.jpg");
+dev.off ();
+
+
+
+```
+
+
+
+
+
+```{r}
+u<-1-0.95
+taildep(Berlin_dt.h_maxh$m.1h ,Berlin_dt.h_maxh$m.2h, u)
+chi.12<-taildep(Berlin_dt.h_maxh$m.1h ,Berlin_dt.h_maxh$m.2h, u, type = "chi")
+chi.13<-taildep(Berlin_dt.h_maxh$m.1h ,Berlin_dt.h_maxh$m.3h, u,  type = "chi")
+chi.16<-taildep(Berlin_dt.h_maxh$m.1h ,Berlin_dt.h_maxh$m.h6, u,  type = "chi")
+chi.112<-taildep(Berlin_dt.h_maxh$m.1h ,Berlin_dt.h_maxh$m.h12, u, type = "chi")
+chi.124<-taildep(Berlin_dt.h_maxh$m.1h ,Berlin_dt.h_maxh$m.h24, u, type = "chi")
+chi.148<-taildep(Berlin_dt.h_maxh$m.1h ,Berlin_dt.h_maxh$m.h48, u, type = "chi")
+chi.172<-taildep(Berlin_dt.h_maxh$m.1h ,Berlin_dt.h_maxh$m.h72, u,type ="chi")
+
+
+chi.23<-taildep(Berlin_dt.h_maxh$m.2h ,Berlin_dt.h_maxh$m.3h, u, type = "chi")
+chi.26<-taildep(Berlin_dt.h_maxh$m.2h ,Berlin_dt.h_maxh$m.h6, u,  type = "chi")
+chi.212<-taildep(Berlin_dt.h_maxh$m.2h ,Berlin_dt.h_maxh$m.h12, u, type ="chi")
+chi.224<-taildep(Berlin_dt.h_maxh$m.2h ,Berlin_dt.h_maxh$m.h24, u, type = "chi")
+chi.248<-taildep(Berlin_dt.h_maxh$m.2h ,Berlin_dt.h_maxh$m.h48, u, type = "chi")
+chi.272<-taildep(Berlin_dt.h_maxh$m.2h ,Berlin_dt.h_maxh$m.h72, u, type = "chi")
+
+
+
+chi.36<-taildep(Berlin_dt.h_maxh$m.3h ,Berlin_dt.h_maxh$m.h6, u,  type = "chi")
+chi.312<-taildep(Berlin_dt.h_maxh$m.3h ,Berlin_dt.h_maxh$m.h12, u, type ="chi")
+chi.324<-taildep(Berlin_dt.h_maxh$m.3h ,Berlin_dt.h_maxh$m.h24, u, type = "chi")
+chi.348<-taildep(Berlin_dt.h_maxh$m.3h ,Berlin_dt.h_maxh$m.h48, u, type = "chi")
+chi.372<-taildep(Berlin_dt.h_maxh$m.3h ,Berlin_dt.h_maxh$m.h72, u, type = "chi")
+
+chi.612<-taildep(Berlin_dt.h_maxh$m.h6 ,Berlin_dt.h_maxh$m.h12, u, type ="chi")
+chi.624<-taildep(Berlin_dt.h_maxh$m.h6 ,Berlin_dt.h_maxh$m.h24, u, type = "chi")
+chi.648<-taildep(Berlin_dt.h_maxh$m.h6 ,Berlin_dt.h_maxh$m.h48, u, type = "chi")
+chi.672<-taildep(Berlin_dt.h_maxh$m.h6 ,Berlin_dt.h_maxh$m.h72, u, type = "chi")
+
+chi.1224<-taildep(Berlin_dt.h_maxh$m.h12 ,Berlin_dt.h_maxh$m.h24, u, type = "chi")
+chi.1248<-taildep(Berlin_dt.h_maxh$m.h12 ,Berlin_dt.h_maxh$m.h48, u, type = "chi")
+chi.1272<-taildep(Berlin_dt.h_maxh$m.h12 ,Berlin_dt.h_maxh$m.h72, u, type = "chi")
+
+chi.2448<-taildep(Berlin_dt.h_maxh$m.h24 ,Berlin_dt.h_maxh$m.h48, u, type = "chi")
+chi.2472<-taildep(Berlin_dt.h_maxh$m.h24 ,Berlin_dt.h_maxh$m.h72, u, type = "chi")
+
+
+chi.4472<-taildep(Berlin_dt.h_maxh$m.h48 ,Berlin_dt.h_maxh$m.h72, u, type = "chi")
+
+chi1 <- c(chi.12, chi.13, chi.16, chi.112, chi.124, chi.148, chi.172)
+chi2 <- c(chi.23, chi.26, chi.212, chi.224, chi.248, chi.272)
+chi3 <- c(chi.36, chi.312, chi.324, chi.348, chi.372)
+
+plot( diff_d1, chi1,  xlab = "Durations[h]", ylab = "chi" , main = " alpha vs difference in durations ", type = "b", col = "blue", xlim = c(1, 71), ylim = c(0.01, 1))
+
+# Add lines for the other two duration groups
+lines( diff_d1, alpha1, type = "b", col = "red")
+lines( diff_d3, chi3,type = "b", col = "green")
+
+# Add a legend
+#legend("topright", legend = c("1h(d1-d2,...,d1-d72)", "2h(d2-d3,...,d2-d72)", "3h(d3-d6,...,d6-d72)"), col = c("blue", "red", "green"), lty = 1)
+
+# Add gridlines
+grid()
+
+
+
+```
+
+
+
+```{r tail dependence function}
+
+#library(texmex)
+dat <- data.frame( Z1, Z2)
+
+u <- 0.95
+chi.12<-taildep(runmean.1h ,runmean.2h, u, type = "chi")
+xun <- sort(runmean.1h)
+yun <- sort(runmean.2h)
+x_i <- quantile(xun, 0.95)
+y_i <- quantile(yun, 0.95)
+id <- (xun > x_i) & (yun > y_i)
+c <- mean(id, na.rm=TRUE)
+chi_u <- 2 - log(c) / log(u)
+# Compute x(u) for a given value of u
+u <- 0.5 # set the value of u
+X <- Z1
+Y <- Z2
+Fx <-  ecdf(X) # compute the empirical CDF of X
+Fy <- ecdf(Y) # compute the empirical CDF of Y
+numerator <- log(mean(pmax(Fx(X), Fy(Y)))[Fx(X) >= u & Fy(Y) >= u])
+denominator <- log(u)
+x_u <- 2- numerator / denominator
+
+t<- data.frame(runmean.1h, runmean.2h)
+
+t.method <- "first"
+data <- cbind(rank(dat[, 1],ties.method = t.method)/(n + 1), 
+                  rank(dat[, 2],ties.method = t.method)/(n + 1))
+u <- 0.95
+# Compute the value of chi(u)
+prob <- mean(data[,1] < u & data[,2] < u)
+log(prob)/log(u)
+chi_u <- 2 - log(prob) / log(u)
+
+# Print the value of chi(u)
+cat("chi(", u, ") = ", chi_u, "\n")
+taildep(data[,1], data[,2], u=0.90)
+E<- cbind(Berlin_dt.h_maxh$m.1h, Berlin_dt.h_maxh$m.2h)
+taildep(E[,1],E[,2] ,0.90)
+
+
+u_seq <- seq(0.1, 0.95, by=0.001)
+# Compute chi for each value of u
+chi_seq <- sapply(u_seq, function(u) {
+  prob <- mean(data[,1] < u & data[,2] < u)
+  2 - log(prob) / log(u)
+})
+chibar_seq <- sapply(u_seq, function(u) {
+  cbaru <-  mean(data[,1] > u & data[,2] > u)
+  (2 * log(1 - u))/log(cbaru) - 1
+})
+
+
+cbaru <-  mean(data[,1] > u & data[,2] > u)
+
+chibr_u <- (2 * log(1 - u))/log(cbaru) - 1
+
+
+
+```
+
+
+```{r}
+
+
+gev.1 = gev.fit(Berlin_dt.h_maxh$m.1h)
+gev.2 = gev.fit(Berlin_dt.h_maxh$m.2h)
+gev.3 =gev.fit(Berlin_dt.h_maxh$m.3h)
+gev.6 = gev.fit(Berlin_dt.h_maxh$m.h6)
+gev.12 = gev.fit(Berlin_dt.h_maxh$m.h12)
+gev.24 = gev.fit(Berlin_dt.h_maxh$m.h24)
+gev.48 = gev.fit(Berlin_dt.h_maxh$m.h48)
+gev.72 = gev.fit(Berlin_dt.h_maxh$m.h72)
+
+```
+
+```{r}
+duration <- c(1, 2, 3, 6, 12, 24,48, 72)
+T <- c(2,5,20,50,100)
+p<-1-1/T
+get_IDF <- function(d) {
+  gev <- get(paste0("gev.", d))
+  IDF <-evd::qgev(p,gev$mle [1],gev$mle [2], gev$mle [3])
+  return(IDF)
+}
+# Apply the function to all durations and store the results in a data frame
+IDF_data <- data.frame(p = p, 
+                       matrix(unlist(lapply(duration, get_IDF)), ncol = length(duration), byrow = FALSE))
+
+colnames(IDF_data)[2:9]<-duration
+IDF_data
+par(mfrow=c(2,2))
+plot(duration,IDF_data[1,2:6], log="xy", type = "l", col = "blue", 
+     xlab = 'Duration [h]',ylab='Intensity [mm/h]')
+title("Unadjusted IDF curves")
+
+```
+
+```{r}
+annlMax <- Berlin_dt.h_maxh[-1]
+n.y<-nrow(annlMax) ## Number of Years in annualMax-table
+n.d<-ncol(annlMax) ## Number of Rainfall Durations
+nllh.ms<-function(par1,d,y) {
+  mu<-par1[1]
+ sigma<-par1[2]
+ gamma<-par1[3]
+theta<-par1[4]
+ eta1<-par1[5]
+eta2<-par1[6]
+ tau=par1[7]
+  d<-c(1,2,3,6,12,24,48,72)
+ lh.mat<-array(0,dim=dim(annualmax))
+ Y<-array(0,dim=dim(annualmax))
+ ##################################
+ ### Loop over rainfall durations
+ ##################################
+ for (i in 1:length(d)) {
+   ds.t <- d[i]+theta
+      sigma.d <-    sigma/(ds.t^eta2)+tau
+      mu.d    <- mu*sigma.d+tau
+  Y[,i]<-1+gamma*(annlMax[,i]-mu.d)/sigma.d
+  if (min(Y[,i],na.rm=TRUE)>0) {
+   lh.mat[,i]<--log(sigma.d)-Y[,i]^(-1/gamma)-(1+1/gamma)*log(Y[,i])   ### GEV-loglikelihood for duration d[i]
+  } 
+  else {
+   lh.mat[,i]<--10^10
+  }
+ }
+  return(-sum(lh.mat,na.rm=TRUE))
+}
+par0<-c(4.08, 1.2 ,0.4,0.05, 0.70,0.09,0.10) ## Inital Value for Optimisation 
+result<-optim(par0,nllh.ms,method="Nelder-Mead",hessian=TRUE) 
+result$par
+```
